@@ -181,7 +181,8 @@ def encode_all_batches(
     resolution: int = 1080,
     max_resolution: int = 0,
     input_noise_scale: float = 0.0,
-    color_correction: str = "wavelet"
+    color_correction: str = "wavelet",
+    load_checkpoint_path: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Phase 1: VAE Encoding for all batches
@@ -257,7 +258,36 @@ def encode_all_batches(
     
     # Detect if input is RGBA (4 channels)
     ctx['is_rgba'] = images[0].shape[-1] == 4
-    
+
+    # ================= [START] METADATA RESUME CHECK =================
+    resume_mode = False
+    if load_checkpoint_path and os.path.exists(load_checkpoint_path):
+        try:
+            # Load only metadata first to check validity
+            # We don't load huge latents here to save RAM
+            checkpoint_data = torch.load(load_checkpoint_path, map_location="cpu")
+            if "metadata" in checkpoint_data:
+                meta = checkpoint_data["metadata"]
+                # Basic validation
+                if meta.get("total_frames") == total_frames:
+                    debug.log(f"Found valid checkpoint metadata. Resuming Phase 1 in Fast-Forward mode.", category="cache", force=True)
+                    
+                    # Restore metadata
+                    ctx['all_ori_lengths'] = meta['all_ori_lengths']
+                    ctx['batch_metadata'] = meta['batch_metadata']
+                    ctx['actual_temporal_overlap'] = meta.get('actual_temporal_overlap', temporal_overlap)
+                    
+                    # We still need to initialize lists, but we won't fill all_latents
+                    # because Phase 2 will provide the upscaled ones directly.
+                    # However, we MUST populate 'all_alpha_channels' and 'all_input_rgb' 
+                    # if RGBA/ColorFix is on, because those are not saved in checkpoint (too big).
+                    resume_mode = True
+                else:
+                    debug.log("Checkpoint frame count mismatch. Re-running Encode.", level="WARNING", category="cache")
+        except Exception as e:
+            debug.log(f"Error checking checkpoint metadata: {e}. Re-running Encode.", level="WARNING", category="cache")
+    # ================= [END METADATA RESUME CHECK] =================
+
     # Display batch optimization tip if applicable
     if total_frames > 0:
         batch_params = calculate_optimal_batch_params(total_frames, batch_size, temporal_overlap)
@@ -287,60 +317,65 @@ def encode_all_batches(
     
     # Pre-allocate lists for memory efficiency
     ctx['all_latents'] = [None] * num_encode_batches
-    ctx['all_ori_lengths'] = [None] * num_encode_batches
-    if color_correction != "none":
-        ctx['batch_metadata'] = [None] * num_encode_batches
+    if not resume_mode:
+        ctx['all_ori_lengths'] = [None] * num_encode_batches
+        if color_correction != "none":
+            ctx['batch_metadata'] = [None] * num_encode_batches
     
     encode_idx = 0
     
     try:
-        # Materialize VAE if still on meta device
-        if runner.vae and next(runner.vae.parameters()).device.type == 'meta':
-            materialize_model(runner, "vae", ctx['vae_device'], runner.config, debug)
-        else:
-            # Model already materialized (cached) - apply any pending configs if needed
-            if getattr(runner, '_vae_config_needs_application', False):
-                debug.log("Applying updated VAE configuration", category="vae", force=True)
-                apply_model_specific_config(runner.vae, runner, runner.config, False, debug)
+        # Load VAE model only if we are NOT resuming
+        if not resume_mode:
+            # Materialize VAE if still on meta device
+            if runner.vae and next(runner.vae.parameters()).device.type == 'meta':
+                materialize_model(runner, "vae", ctx['vae_device'], runner.config, debug)
+            else:
+                # Model already materialized (cached) - apply any pending configs if needed
+                if getattr(runner, '_vae_config_needs_application', False):
+                    debug.log("Applying updated VAE configuration", category="vae", force=True)
+                    apply_model_specific_config(runner.vae, runner, runner.config, False, debug)
         
-        # Initialize precision after VAE is materialized with actual weights
-        ensure_precision_initialized(ctx, runner, debug)
+            # Initialize precision after VAE is materialized with actual weights
+            ensure_precision_initialized(ctx, runner, debug)
 
-        # Cache VAE now that it's fully configured and ready for inference
-        if ctx['cache_context']['vae_cache'] and not ctx['cache_context']['cached_vae']:
-            runner.vae._model_name = ctx['cache_context']['vae_model']
-            ctx['cache_context']['global_cache'].set_vae(
-                {'node_id': ctx['cache_context']['vae_id'], 'cache_model': True}, 
-                runner.vae, ctx['cache_context']['vae_model'], debug
-            )
-            ctx['cache_context']['vae_newly_cached'] = True
-            
-            # If both models now cached, cache runner template
-            dit_is_cached = ctx['cache_context']['cached_dit'] or ctx['cache_context']['dit_newly_cached']
-            if dit_is_cached:
-                ctx['cache_context']['global_cache'].set_runner(
-                    ctx['cache_context']['dit_id'], ctx['cache_context']['vae_id'], 
-                    runner, debug
+            # Cache VAE now that it's fully configured and ready for inference
+            if ctx['cache_context']['vae_cache'] and not ctx['cache_context']['cached_vae']:
+                runner.vae._model_name = ctx['cache_context']['vae_model']
+                ctx['cache_context']['global_cache'].set_vae(
+                    {'node_id': ctx['cache_context']['vae_id'], 'cache_model': True}, 
+                    runner.vae, ctx['cache_context']['vae_model'], debug
                 )
+                ctx['cache_context']['vae_newly_cached'] = True
+            
+                # If both models now cached, cache runner template
+                dit_is_cached = ctx['cache_context']['cached_dit'] or ctx['cache_context']['dit_newly_cached']
+                if dit_is_cached:
+                    ctx['cache_context']['global_cache'].set_runner(
+                        ctx['cache_context']['dit_id'], ctx['cache_context']['vae_id'], 
+                        runner, debug
+                    )
         
-        # Set deterministic seed for VAE encoding (separate from diffusion noise)
-        # Uses seed + 1,000,000 to avoid collision with upscaling batch seeds
-        # This ensures VAE sampling is deterministic while maintaining quality
-        seed_vae = seed + 1000000
-        set_seed(seed_vae)
-        debug.log(f"Using seed: {seed_vae} (VAE uses seed+1000000 for deterministic sampling)", category="vae")
+            # Set deterministic seed for VAE encoding (separate from diffusion noise)
+            # Uses seed + 1,000,000 to avoid collision with upscaling batch seeds
+            # This ensures VAE sampling is deterministic while maintaining quality
+            seed_vae = seed + 1000000
+            set_seed(seed_vae)
+            debug.log(f"Using seed: {seed_vae} (VAE uses seed+1000000 for deterministic sampling)", category="vae")
         
-        # Move VAE to GPU for encoding (no-op if already there)
-        manage_model_device(model=runner.vae, target_device=ctx['vae_device'], 
-                          model_name="VAE", debug=debug, runner=runner)
+            # Move VAE to GPU for encoding (no-op if already there)
+            manage_model_device(model=runner.vae, target_device=ctx['vae_device'], 
+                              model_name="VAE", debug=debug, runner=runner)
         
-        debug.log_memory_state("After VAE loading for encoding", detailed_tensors=False)
+            debug.log_memory_state("After VAE loading for encoding", detailed_tensors=False)
 
-        # Initialize tile_boundaries for encoding debug
-        if runner.tile_debug == "encode" and runner.encode_tiled:
-            debug.encode_tile_boundaries = []
-            debug.log("Tile debug enabled: encode tile boundaries will be visualized", category="vae", force=True)
-            debug.log("Remember to disable --tile_debug in production to remove overlay visualization", category="tip", indent_level=1, force=True)
+            # Initialize tile_boundaries for encoding debug
+            if runner.tile_debug == "encode" and runner.encode_tiled:
+                debug.encode_tile_boundaries = []
+                debug.log("Tile debug enabled: encode tile boundaries will be visualized", category="vae", force=True)
+                debug.log("Remember to disable --tile_debug in production to remove overlay visualization", category="tip", indent_level=1, force=True)
+        else:
+            debug.log("Skipping VAE model load (Resume Mode)", category="vae")
         
         # Process encoding
         for batch_idx in range(0, total_frames, step):
@@ -359,6 +394,57 @@ def encode_all_batches(
             current_frames = end_idx - start_idx
             is_uniform_padding = uniform_batch_size and current_frames < batch_size
             
+            # --- RESUME MODE LOGIC ---
+            if resume_mode:
+                # If resuming, we skip VAE encoding entirely.
+                # However, Phase 4 requires Alpha channel and Original RGB buffers for edge-guided upscaling
+                # and color correction. Since these are too large to save in checkpoint, we reconstruct them here.
+                needs_buffers = ctx.get('is_rgba', False) or (color_correction != "none" and ctx.get('is_rgba', False))
+
+                if needs_buffers:
+                    debug.log(f"Restoring auxiliary buffers for batch {encode_idx+1}/{num_encode_batches}...", category="cache")
+                    debug.log(f"Restoring auxiliary buffers for batch {encode_idx+1}/{num_encode_batches}...", category="cache")
+                    
+                    # Re-run video prep (Fast IO operation)
+                    video = _prepare_video_batch(
+                        images=images, start_idx=start_idx, end_idx=end_idx,
+                        uniform_padding=batch_size - current_frames if is_uniform_padding else 0,
+                        debug=debug, log_info=False
+                    )
+                    video = video.to(ctx['compute_dtype'])
+                    
+                    # Apply 4n+1 padding logic to match original shape
+                    t = video.size(0)
+                    if t % 4 != 1:
+                        video = _apply_4n1_padding(video)
+                    
+                    # Store Alpha/RGB if needed (Input is RGBA)
+                    if ctx.get('is_rgba', False):
+                        if 'all_alpha_channels' not in ctx:
+                            ctx['all_alpha_channels'] = [None] * num_encode_batches
+                        if 'all_input_rgb' not in ctx:
+                            ctx['all_input_rgb'] = [None] * num_encode_batches
+                        
+                        # Extract channels
+                        alpha_channel = video[:, 3:4, :, :]
+                        rgb_video_original = video[:, :3, :, :]
+                        
+                        # Store buffers (offload to CPU/disk if configured)
+                        if ctx['tensor_offload_device'] is not None:
+                            ctx['all_alpha_channels'][encode_idx] = alpha_channel.to(ctx['tensor_offload_device'])
+                            ctx['all_input_rgb'][encode_idx] = rgb_video_original.to(ctx['tensor_offload_device'])
+                        else:
+                            ctx['all_alpha_channels'][encode_idx] = alpha_channel
+                            ctx['all_input_rgb'][encode_idx] = rgb_video_original
+                    
+                    del video
+                
+                # Advance index and continue to next batch without VAE inference
+                encode_idx += 1
+                continue 
+            # --- END RESUME MODE LOGIC ---
+            
+            # --- NORMAL ENCODING LOGIC ---
             debug.log(f"Encoding batch {encode_idx+1}/{num_encode_batches}", category="vae", force=True)
             debug.start_timer(f"encode_batch_{encode_idx+1}")
             
@@ -529,7 +615,7 @@ def encode_all_batches(
         raise
     finally:
         # Offload VAE to configured offload device if specified
-        if ctx['vae_offload_device'] is not None:
+        if ctx['vae_offload_device'] is not None and not resume_mode:
             manage_model_device(model=runner.vae, target_device=ctx['vae_offload_device'], 
                                 model_name="VAE", debug=debug, reason="VAE offload", runner=runner)
     
@@ -546,7 +632,9 @@ def upscale_all_batches(
     progress_callback: Optional[Callable[[int, int, int, str], None]] = None,
     seed: int = 42,
     latent_noise_scale: float = 0.0,
-    cache_model: bool = False
+    cache_model: bool = False,
+    save_checkpoint_path: Optional[str] = None,
+    load_checkpoint_path: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Phase 2: DiT Upscaling for all encoded batches.
@@ -565,6 +653,8 @@ def upscale_all_batches(
                            but may help with certain artifacts. 0.0 = no noise (crisp),
                            1.0 = maximum noise (softer)
         cache_model: If True, keep DiT model for reuse instead of deleting it
+        save_checkpoint_path: If provided, save upscaled latents to this specific path.
+        load_checkpoint_path: If provided, try to load latents from this specific path.
         
     Returns:
         dict: Updated context containing:
@@ -581,12 +671,59 @@ def upscale_all_batches(
     if ctx is None:
         raise ValueError("Context is required for upscale_all_batches. Run encode_all_batches first.")
         
-    # Validate we have encoded latents
+    # Validate context has 'all_latents' list initialized (even if elements are None due to resume)
     if 'all_latents' not in ctx or not ctx['all_latents']:
         raise ValueError("No encoded latents found. Run encode_all_batches first.")
     
     debug.log("", category="none", force=True)
     debug.log("━━━━━━━━ Phase 2: DiT upscaling ━━━━━━━━", category="none", force=True)
+    
+    # ================= [START] CHECKPOINT LOAD LOGIC =================
+    # Use the specific path provided by the user/caller and check if checkpoint exists
+    if load_checkpoint_path and os.path.exists(load_checkpoint_path):
+        debug.log(f"Found Phase 2 checkpoint: {load_checkpoint_path}", category="cache", force=True)
+        debug.log(f"Skipping DiT upscaling and loading from disk...", category="cache", force=True)
+        try:
+            # Load checkpoint data (latents + metadata)
+            checkpoint_data = torch.load(load_checkpoint_path, map_location="cpu")
+            
+            # Handle both new format (dict) and legacy format (list)
+            if isinstance(checkpoint_data, dict) and "upscaled_latents" in checkpoint_data:
+                loaded_latents = checkpoint_data["upscaled_latents"]
+                # Metadata was already processed/verified in Phase 1, so we focus on latents here
+            else:
+                # Fallback for older checkpoints
+                loaded_latents = checkpoint_data
+            
+            # Validation: Check if the number of batches in checkpoint matches current parameters
+            # Phase 1 initializes 'all_latents' with the correct length based on current batch_size/resolution.
+            expected_batches = len(ctx.get('all_latents', []))
+            loaded_count = len(loaded_latents)
+            
+            if loaded_count == expected_batches and expected_batches > 0:
+                ctx['all_upscaled_latents'] = loaded_latents
+                debug.log(f"Checkpoint loaded successfully ({loaded_count} batches)! Skipping DiT computation.", category="success", force=True)
+                
+                # Free Phase 1 latents to save memory (if they exist)
+                # In Resume Mode, these are already None, but this loop is safe.
+                for i in range(len(ctx['all_latents'])):
+                    if ctx['all_latents'][i] is not None:
+                        release_tensor_memory(ctx['all_latents'][i])
+                        ctx['all_latents'][i] = None
+                
+                # Exit early - Skip Phase 2 inference entirely
+                return ctx
+            else:
+                debug.log(f"Checkpoint mismatch: Loaded {loaded_count} batches, but expected {expected_batches} (based on current resolution/batch_size). Re-running.", level="WARNING", category="cache")
+
+        except Exception as e:
+            debug.log(f"Failed to load checkpoint: {e}. Re-running.", level="WARNING", category="cache")
+    # ================= [END CHECKPOINT LOAD LOGIC] =================
+            
+    # If we reached here, we MUST compute DiT. Validate inputs.
+    if all(l is None for l in ctx['all_latents']):
+        raise ValueError("No input latents found and no valid checkpoint loaded. Cannot proceed.")
+
     debug.start_timer("phase2_upscaling")
     
     # Load text embeddings if not already loaded
@@ -603,7 +740,7 @@ def upscale_all_batches(
 
     # Count valid latents
     num_valid_latents = len([l for l in ctx['all_latents'] if l is not None])
-
+    
     # Safety check for empty latents
     if num_valid_latents == 0:
         debug.log("No valid latents to upscale", level="WARNING", category="dit", force=True)
@@ -769,7 +906,7 @@ def upscale_all_batches(
                 debug.log("BlockSwap Summary", category="blockswap")
                 debug.log(f"BlockSwap overhead: {total_time:.2f}ms", category="blockswap", indent_level=1)
                 debug.log(f"Total swaps: {swap_summary['total_swaps']}", category="blockswap", indent_level=1)
-                
+
                 # Show block swap details
                 if 'block_swaps' in swap_summary and swap_summary['block_swaps'] > 0:
                     avg_ms = swap_summary.get('block_avg_ms', 0)
@@ -801,6 +938,44 @@ def upscale_all_batches(
     debug.end_timer("phase2_upscaling", "Phase 2: DiT upscaling complete", show_breakdown=True)
     debug.log_memory_state("After phase 2 (DiT upscaling)", show_tensors=False)
     
+    # ================= [START] CHECKPOINT SAVE LOGIC =================
+    if save_checkpoint_path:
+        try:
+            # Create directory if it doesn't exist (assuming user passed full path)
+            ckpt_dir = os.path.dirname(save_checkpoint_path)
+            if ckpt_dir:
+                os.makedirs(ckpt_dir, exist_ok=True)
+                
+            debug.log(f"Saving Phase 2 checkpoint to: {save_checkpoint_path}", category="cache", force=True)
+            
+            # Move tensors to CPU and detach to avoid saving gradients and reduce file size
+            latents_to_save = []
+            for latent in ctx['all_upscaled_latents']:
+                if latent is not None:
+                    # Ensure it's a CPU tensor and clone pure data
+                    latents_to_save.append(latent.detach().cpu().clone())
+                else:
+                    latents_to_save.append(None)
+
+            # Save Dictionary: Latents + Metadata (from Phase 1)
+            checkpoint_data = {
+                "version": 1.0,
+                "upscaled_latents": latents_to_save,
+                "metadata": {
+                    "all_ori_lengths": ctx.get('all_ori_lengths'),
+                    "batch_metadata": ctx.get('batch_metadata'),
+                    "total_frames": ctx.get('total_frames'),
+                    "true_target_dims": ctx.get('true_target_dims'),
+                    "actual_temporal_overlap": ctx.get('actual_temporal_overlap')
+                }
+            }
+            
+            torch.save(checkpoint_data, save_checkpoint_path)
+            debug.log(f"Phase 2 checkpoint saved to {save_checkpoint_path}", category="success", force=True)
+        except Exception as e:
+            debug.log(f"Failed to save checkpoint: {e}", level="WARNING", category="cache")
+    # ================= [END CHECKPOINT SAVE LOGIC] =================
+
     return ctx
 
 

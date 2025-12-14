@@ -957,7 +957,8 @@ def _process_frames_core(
         resolution=args.resolution,
         max_resolution=args.max_resolution,
         input_noise_scale=args.input_noise_scale,
-        color_correction=args.color_correction
+        color_correction=args.color_correction,
+        load_checkpoint_path=args.load_phase2_path
     )
     
     # Phase 2: Upscale
@@ -965,7 +966,9 @@ def _process_frames_core(
         runner, ctx=ctx, debug=debug, progress_callback=None,
         seed=args.seed,
         latent_noise_scale=args.latent_noise_scale,
-        cache_model=cache_dit
+        cache_model=cache_dit,
+        save_checkpoint_path=args.save_phase2_path,
+        load_checkpoint_path=args.load_phase2_path 
     )
     
     # Phase 3: Decode
@@ -1456,6 +1459,12 @@ Examples:
     cache_group.add_argument("--cache_vae", action="store_true",
                         help="Keep VAE model in memory between generations. Works with single-GPU directory processing "
                              "or multi-GPU streaming (--chunk_size). Requires --vae_offload_device")
+
+    # --- CHECKPOINT PATH ARGUMENTS ---
+    cache_group.add_argument("--save_phase2_path", type=str, default=None,
+                        help="Path to save Phase 2 (DiT) upscaled latents. Useful for resuming or multi-user isolation.")
+    cache_group.add_argument("--load_phase2_path", type=str, default=None,
+                        help="Path to load Phase 2 (DiT) upscaled latents from. Skips DiT inference if file exists.")
     
     # Debugging
     debug_group = parser.add_argument_group('Debugging')
