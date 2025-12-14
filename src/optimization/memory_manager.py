@@ -552,6 +552,17 @@ def release_model_memory(model: Optional[torch.nn.Module], debug: Optional['Debu
     if model is None:
         return
     
+    # If the model has pipelining resources (swap stream), synchronize to ensure no pending async ops
+    try:
+        if hasattr(model, "_swap_stream"):
+            try:
+                model._swap_stream.synchronize()
+            except Exception:
+                if debug:
+                    debug.log("Failed to synchronize model._swap_stream before releasing memory", level="WARNING", category="memory", force=True)
+    except Exception:
+        pass
+
     try:
         # Clear gradients first
         model.zero_grad(set_to_none=True)
@@ -778,6 +789,15 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         # Enable bypass to allow movement
         set_blockswap_bypass(runner=runner, bypass=True, debug=debug)
         
+        # If a pipelined swap stream exists, synchronize it to ensure no pending async transfers
+        if hasattr(model, "_swap_stream"):
+            try:
+                model._swap_stream.synchronize()
+            except Exception:
+                # Best-effort; don't fail the movement if synchronize not supported
+                if debug:
+                    debug.log("Failed to synchronize model._swap_stream before offload", level="WARNING", category="memory", force=True)
+
         # Start timer
         timer_name = f"{model_name.lower()}_to_{target_type}"
         if debug:
@@ -786,6 +806,19 @@ def _handle_blockswap_model_movement(runner: Any, model: torch.nn.Module,
         # Move entire model to target offload device
         model.to(target_device)
         model.zero_grad(set_to_none=True)
+
+        # After moving to CPU, attempt to pin CPU tensors to enable non-blocking async copies later.
+        try:
+            for p in model.parameters():
+                if p.device.type == "cpu" and p.numel() > 0 and not p.data.is_pinned():
+                    p.data = p.data.pin_memory()
+            for b in model.buffers():
+                if b.device.type == "cpu" and b.numel() > 0 and not b.data.is_pinned():
+                    b.data = b.data.pin_memory()
+        except Exception as e:
+            # Pinning is best-effort; log and continue
+            if debug:
+                debug.log(f"Pin-memory on offloaded model failed: {e}", level="WARNING", category="memory", force=True)
         
         if debug:
             debug.end_timer(timer_name, f"BlockSwap model offloaded to {_device_str(target_device)}")
@@ -1070,8 +1103,21 @@ def cleanup_dit(runner: Any, debug: Optional['Debug'] = None, cache_model: bool 
     if hasattr(runner, "_blockswap_active") and runner._blockswap_active:
         # Import here to avoid circular dependency
         from .blockswap import cleanup_blockswap
+
+        # If model had a swap stream, synchronize before cleanup to avoid races
+        try:
+            model_for_sync = runner.dit.dit_model if hasattr(runner.dit, 'dit_model') else runner.dit
+            if hasattr(model_for_sync, "_swap_stream"):
+                try:
+                    model_for_sync._swap_stream.synchronize()
+                except Exception:
+                    if debug:
+                        debug.log("Failed to synchronize model._swap_stream before cleanup_blockswap", level="WARNING", category="cleanup", force=True)
+        except Exception:
+            pass
+
         cleanup_blockswap(runner=runner, keep_state_for_cache=cache_model)
-    
+
     # 4. Complete cleanup if not caching
     if not cache_model:
         release_model_memory(model=runner.dit, debug=debug)

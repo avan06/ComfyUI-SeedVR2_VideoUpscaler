@@ -250,7 +250,30 @@ def apply_block_swap_to_dit(
     # Log memory summary
     _log_memory_summary(memory_stats, offload_device, device, swap_io_components, 
                        debug)
-    
+
+    # Initialize Nunchaku-style async management object
+    if blocks_to_swap > 0:
+        # normalize device objects
+        if isinstance(device, str):
+            device = torch.device(device)
+        # Create a dedicated stream for memory transfer to avoid blocking compute stream
+        model._swap_stream = torch.cuda.Stream(device=device)
+        # Event dictionary to track if a block transfer is complete
+        model._block_ready_events = {}
+
+        # Preload first swapped block to seed pipeline (non-blocking on swap_stream)
+        try:
+            first_idx = 0
+            if first_idx <= model.blocks_to_swap:
+                with torch.cuda.stream(model._swap_stream):
+                    model.blocks[first_idx].to(device, non_blocking=True)
+                    ev = torch.cuda.Event(blocking=False)
+                    ev.record(model._swap_stream) # record on swap_stream -> event gets device-bound here
+                    model._block_ready_events[first_idx] = ev
+        except Exception as e:
+            debug.log(f"Failed to initialize swap-stream prefetch: {e}", level="WARNING", category="blockswap", force=True)
+
+
     # Wrap block forward methods for dynamic swapping (only if blocks_to_swap > 0)
     if blocks_to_swap > 0:
         for b, block in enumerate(model.blocks):
@@ -313,6 +336,9 @@ def _configure_io_components(
     io_memory_mb = 0.0
     io_gpu_memory_mb = 0.0
     
+    # Check for pin memory condition
+    use_pin_memory = (offload_device == "cpu") if isinstance(offload_device, str) else (offload_device.type == "cpu")
+
     # Handle I/O modules with dynamic swapping
     for name, module in model.named_children():
         if name != "blocks":
@@ -320,6 +346,16 @@ def _configure_io_components(
             
             if swap_io_components:
                 module.to(offload_device)
+                
+                # Enable Pin Memory for I/O components
+                if use_pin_memory:
+                    for p in module.parameters():
+                        if not p.is_pinned():
+                            p.data = p.data.pin_memory()
+                    for buf in module.buffers():
+                        if not buf.is_pinned():
+                            buf.data = buf.data.pin_memory()
+
                 _wrap_io_forward(module, name, model, debug)
                 io_components_offloaded.append(name)
                 io_memory_mb += module_memory
@@ -365,6 +401,10 @@ def _configure_blocks(
     """
     total_offload_memory = 0.0
     total_main_memory = 0.0
+    
+    # Check if we should pin memory (if offloading to CPU)
+    # Nunchaku uses pinned memory for faster async transfers
+    use_pin_memory = (offload_device == "cpu") if isinstance(offload_device, str) else (offload_device.type == "cpu")
 
     # Move blocks based on swap configuration
     for b, block in enumerate(model.blocks):
@@ -376,12 +416,24 @@ def _configure_blocks(
         else:
             block.to(offload_device, non_blocking=False)
             total_offload_memory += block_memory
-
+            
+            # Enable Pin Memory optimization for CPU Offload transfer speed
+            if use_pin_memory:
+                for p in block.parameters():
+                    if not p.is_pinned():
+                        p.data = p.data.pin_memory()
+                for buf in block.buffers():
+                    if not buf.is_pinned():
+                        buf.data = buf.data.pin_memory()
+                        
     # Ensure all buffers match their containing module's device
     for b, block in enumerate(model.blocks):
         target_device = device if b > model.blocks_to_swap else offload_device
         for name, buffer in block.named_buffers():
             if buffer.device != torch.device(target_device):
+                # Apply pinning if needed
+                if use_pin_memory and target_device.type == "cpu" and not buffer.is_pinned():
+                    buffer.data = buffer.data.pin_memory()
                 buffer.data = buffer.data.to(target_device, non_blocking=False)
 
     return {
@@ -456,6 +508,9 @@ def _wrap_block_forward(
 ) -> None:
     """
     Wrap individual transformer block forward for dynamic device swapping.
+
+    Implements Nunchaku-style pipelining: Prefetch Next -> Compute Current -> Offload Current.
+    https://github.com/nunchaku-tech/nunchaku/blob/main/nunchaku/models/utils.py
     
     Creates a wrapped forward method that automatically:
     1. Moves block to GPU before computation
@@ -479,7 +534,7 @@ def _wrap_block_forward(
     
     # Create weak references
     model_ref = weakref.ref(model)
-    debug_ref = weakref.ref(debug)
+    debug_ref = weakref.ref(debug) if debug is not None else (lambda: None)
     
     # Store block_idx on the block itself to avoid closure issues
     block._block_idx = block_idx
@@ -497,22 +552,53 @@ def _wrap_block_forward(
         if hasattr(model, 'blocks_to_swap') and self._block_idx <= model.blocks_to_swap:
             # Use dynamo-disabled helper to get start time (avoids compilation warnings)
             t_start = _get_swap_start_time(debug, debug.enabled if debug else False)
-
+            
             # Only move to GPU if necessary
             current_device = next(self.parameters()).device
             target_device = torch.device(model.main_device)
             
-            if current_device != target_device:
-                self.to(model.main_device, non_blocking=False)
+            # 1. Ensure CURRENT block is ready on GPU
+            # Check if we have a prefetch event waiting
+            if hasattr(model, '_block_ready_events') and self._block_idx in model._block_ready_events:
+                # Wait for the swap stream to finish moving this block
+                torch.cuda.current_stream().wait_event(model._block_ready_events[self._block_idx])
+                # Cleanup event
+                del model._block_ready_events[self._block_idx]
+            elif current_device != target_device:
+                # Fallback: First block or missed prefetch, move synchronously (but non-blocking)
+                debug.log(f"[blockswap] Block {self._block_idx} missing prefetch event, moving synchronously", level="WARNING", category="blockswap", force=True)
+                self.to(model.main_device, non_blocking=True)
+            
+            # 2. Trigger Prefetch for NEXT block (Pipelining)
+            # Nunchaku logic: Start moving i+1 while i is computing
+            next_idx = self._block_idx + 1
+            if next_idx <= model.blocks_to_swap:
+                next_block = model.blocks[next_idx]
+                # Use the dedicated swap stream
+                with torch.cuda.stream(model._swap_stream):
+                    next_block.to(model.main_device, non_blocking=True)
+                    # Record event so next iteration knows when to wait
+                    event = torch.cuda.Event(blocking=False)
+                    event.record(model._swap_stream)
+                    model._block_ready_events[next_idx] = event
 
-            # Execute forward pass with OOM protection
+            # 3. Execute forward pass (Compute)
+            # This runs on the default stream, overlapping with the prefetch above
             output = original_forward(*args, **kwargs)
 
-            # Move back to offload device
-            self.to(model.offload_device, non_blocking=False)
+            # 4. Offload CURRENT block (Async)
+            # We record an event on compute stream to ensure we don't move data while it's being used
+            compute_done_event = torch.cuda.Event(blocking=False)
+            compute_done_event.record(torch.cuda.current_stream())
             
+            with torch.cuda.stream(model._swap_stream):
+                # Wait for compute to finish before moving memory out
+                model._swap_stream.wait_event(compute_done_event)
+                # Move back to offload device
+                self.to(model.offload_device, non_blocking=True)
+
             # Use dynamo-disabled helper to log timing (avoids compilation warnings)
-            _log_swap_timing(debug, t_start, self._block_idx, "block")
+            _log_swap_timing(debug, t_start, self._block_idx, "block (pipelined)")
 
             # Only clear cache under memory pressure
             clear_memory(debug=debug, deep=False, force=False, timer_name="wrap_block_forward")
@@ -520,7 +606,7 @@ def _wrap_block_forward(
             output = original_forward(*args, **kwargs)
 
         return output
-
+    
     # Bind the wrapped function as a method to the block
     block.forward = types.MethodType(wrapped_forward, block)
     
@@ -930,6 +1016,16 @@ def cleanup_blockswap(runner, keep_state_for_cache=False):
     # 6. Clean up runner attributes
     runner._blockswap_active = False
     
+    # Clean up pipelining resources on model (synchronize first)
+    if hasattr(model, '_swap_stream'):
+        try:
+            model._swap_stream.synchronize()
+        except Exception:
+            pass
+    for attr in ['_swap_stream', '_block_ready_events']:
+        if hasattr(model, attr):
+            delattr(model, attr)
+
     # Remove all config attributes
     for attr in ['_cached_blockswap_config', '_block_swap_config', '_blockswap_debug']:
         if hasattr(runner, attr):
